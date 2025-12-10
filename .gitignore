@@ -1,207 +1,295 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import logging
+import random
+import sqlite3
+from datetime import datetime
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
+import asyncio
 
-# C extensions
-*.so
+# ----------------------------
+# CONFIG (Render environment variables)
+# ----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8526085694:AAH-kRVcN8Goxv3-axNu6QMzNP6-ykTevi0")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "454246152"))
+PUBLIC_CHAT_ID = int(os.getenv("PUBLIC_CHAT_ID", "-1003311097361"))
+DB_NAME = "lottery.db"
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ----------------------------
+# DATABASE INITIALIZATION
+# ----------------------------
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+cursor = conn.cursor()
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+def init_db():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            name TEXT,
+            phone TEXT,
+            category TEXT,
+            item TEXT,
+            price INTEGER,
+            payment_method TEXT,
+            receipt TEXT UNIQUE,
+            lotto TEXT UNIQUE,
+            winner INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS valid_receipts (
+            receipt TEXT PRIMARY KEY
+        )
+    """)
+    conn.commit()
+    print("[OK] Database ready.")
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+def add_valid_receipt(receipt: str):
+    try:
+        cursor.execute("INSERT INTO valid_receipts (receipt) VALUES (?)", (receipt,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+def receipt_exists(receipt: str):
+    cursor.execute("SELECT 1 FROM users WHERE receipt=?", (receipt,))
+    return cursor.fetchone() is not None
 
-# Translations
-*.mo
-*.pot
+def generate_unique_lotto(category):
+    while True:
+        lotto_number = f"LC-{random.randint(100000, 999999)}"
+        cursor.execute("SELECT 1 FROM users WHERE lotto=? AND category=?", (lotto_number, category))
+        if cursor.fetchone() is None:
+            return lotto_number
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ----------------------------
+# STATES
+# ----------------------------
+NAME, PHONE, CATEGORY, PAYMENT_METHOD, RECEIPT, CONFIRM = range(6)
 
-# Flask stuff:
-instance/
-.webassets-cache
+# ----------------------------
+# REGISTRATION FLOW
+# ----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("⚠️ Please DM me in private to join the lottery.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "👋 Welcome to *LuckyCarLottery!*\n\nPlease enter your full name:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return NAME
 
-# Scrapy stuff:
-.scrapy
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("📱 Now enter your phone number (+251XXXXXXXXX or 09XXXXXXXXX):")
+    return PHONE
 
-# Sphinx documentation
-docs/_build/
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    if not (phone.startswith("+251") or phone.startswith("09")) or not phone.replace("+", "").isdigit():
+        await update.message.reply_text("⚠️ Invalid phone. Use +251XXXXXXXXX or 09XXXXXXXXX.")
+        return PHONE
+    context.user_data["phone"] = phone
 
-# PyBuilder
-.pybuilder/
-target/
+    keyboard = [
+        [InlineKeyboardButton("🚗 Car Lottery (1000 Birr)", callback_data="Car")],
+        [InlineKeyboardButton("📱 Mobile Lottery (400 Birr)", callback_data="Mobile")]
+    ]
+    await update.message.reply_text("🎯 Choose lottery category:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CATEGORY
 
-# Jupyter Notebook
-.ipynb_checkpoints
+async def category_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    context.user_data["category"] = choice
 
-# IPython
-profile_default/
-ipython_config.py
+    if choice == "Car":
+        context.user_data["item"] = "Lifan 520 Model 2014 Color Silver"
+        context.user_data["price"] = 1000
+    else:
+        context.user_data["item"] = "S25 Ultra 256/12"
+        context.user_data["price"] = 400
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    keyboard = [
+        [InlineKeyboardButton("📱 Telebirr", callback_data="Telebirr")],
+        [InlineKeyboardButton("🏦 CBE", callback_data="CBE")]
+    ]
+    await query.edit_message_text(
+        f"🎯 You selected *{context.user_data['item']}* (Price: {context.user_data['price']} Birr)\n\n💰 Choose payment method:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PAYMENT_METHOD
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+async def payment_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data
+    context.user_data["payment_method"] = method
+    if method == "Telebirr":
+        msg = "📱 Pay via Telebirr: 0948309164 (Eyuel)"
+    else:
+        msg = "🏦 Pay via CBE: 1000439672343 (Eyuel Getye)"
+    await query.edit_message_text(f"{msg}\n\n💳 After payment, send your receipt number:")
+    return RECEIPT
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+async def get_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    receipt = update.message.text.strip()
+    method = context.user_data["payment_method"]
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+    if method == "Telebirr" and not receipt.startswith("CL"):
+        await update.message.reply_text("❌ Telebirr receipts must start with CL.")
+        return RECEIPT
+    if method == "CBE" and not receipt.startswith("FT"):
+        await update.message.reply_text("❌ CBE receipts must start with FT.")
+        return RECEIPT
+    if receipt_exists(receipt):
+        await update.message.reply_text("❌ This receipt number is already used.")
+        return RECEIPT
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+    context.user_data["receipt"] = receipt
+    add_valid_receipt(receipt)
+    context.user_data["lotto_number"] = generate_unique_lotto(context.user_data["category"])
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    summary = (
+        f"📋 *Confirm your details:*\n\n"
+        f"👤 Name: {context.user_data['name']}\n"
+        f"📱 Phone: {context.user_data['phone']}\n"
+        f"🎯 Category: {context.user_data['category']}\n"
+        f"📝 Item: {context.user_data['item']}\n"
+        f"💰 Price: {context.user_data['price']} Birr\n"
+        f"💳 Payment: {context.user_data['payment_method']}\n"
+        f"📄 Receipt: {receipt}\n"
+        f"🎟️ Lotto: {context.user_data['lotto_number']}"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
+         InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]
+    await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CONFIRM
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+async def confirm_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Submission cancelled.")
+        return ConversationHandler.END
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    user = query.from_user
+    cursor.execute("""
+        INSERT INTO users (user_id, username, name, phone, category, item, price, payment_method, receipt, lotto)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user.id, user.username, context.user_data["name"], context.user_data["phone"],
+        context.user_data["category"], context.user_data["item"], context.user_data["price"],
+        context.user_data["payment_method"], context.user_data["receipt"], context.user_data["lotto_number"]
+    ))
+    conn.commit()
 
-# SageMath parsed files
-*.sage.py
+    await query.edit_message_text(
+        f"✅ Payment confirmed!\n🎉 Thank you, {context.user_data['name']}!\n"
+        f"Your lottery number: *{context.user_data['lotto_number']}*",
+        parse_mode="Markdown"
+    )
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    return ConversationHandler.END
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# ----------------------------
+# ADMIN COMMANDS
+# ----------------------------
+async def addreceipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("❌ Admin only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /addreceipt <number>")
+    add_valid_receipt(context.args[0])
+    await update.message.reply_text("✅ Receipt added.")
 
-# Rope project settings
-.ropeproject
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("❌ Admin only.")
+    cursor.execute("SELECT category, COUNT(*), SUM(price) FROM users GROUP BY category")
+    rows = cursor.fetchall()
+    msg = "📊 Lottery Stats\n\n"
+    for r in rows:
+        msg += f"{r[0]}: {r[1]} entries | Revenue: {r[2] or 0} Birr\n"
+    await update.message.reply_text(msg)
 
-# mkdocs documentation
-/site
+# ----------------------------
+# WINNER SELECTION
+# ----------------------------
+async def pick_winners(context: ContextTypes.DEFAULT_TYPE):
+    for category in ["Car", "Mobile"]:
+        cursor.execute("SELECT user_id, username, lotto FROM users WHERE category=? AND winner=0", (category,))
+        entries = cursor.fetchall()
+        if entries:
+            winner = random.choice(entries)
+            cursor.execute("UPDATE users SET winner=1 WHERE lotto=?", (winner[2],))
+            conn.commit()
+            msg = f"🎉 {category} Winner: @{winner[1] or 'N/A'} | {winner[2]}"
+            await context.bot.send_message(ADMIN_CHAT_ID, msg)
+            await context.bot.send_message(PUBLIC_CHAT_ID, msg)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+# ----------------------------
+# MAIN (Unified for VS Code + Render)
+# ----------------------------
+def main():
+    logging.basicConfig(level=logging.INFO)
+    init_db()
 
-# Pyre type checker
-.pyre/
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# pytype static type analyzer
-.pytype/
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            CATEGORY: [CallbackQueryHandler(category_choice)],
+            PAYMENT_METHOD: [CallbackQueryHandler(payment_choice)],
+            RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_receipt)],
+            CONFIRM: [CallbackQueryHandler(confirm_submission)]
+        },
+        fallbacks=[],
+    )
 
-# Cython debug symbols
-cython_debug/
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("addreceipt", addreceipt))
+    app.add_handler(CommandHandler("logs", logs))
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(pick_winners, "cron", hour=18, minute=0, args=[app])
+    scheduler.start()
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+    print("[OK] Bot running (Render or local)...")
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+    async def run():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        print("[READY] Bot started successfully!")
+        await asyncio.Event().wait()  # Keeps running
 
-# Ruff stuff:
-.ruff_cache/
+    asyncio.run(run())
 
-# PyPI configuration file
-.pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+if __name__ == "__main__":
+    main()
